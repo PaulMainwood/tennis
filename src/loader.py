@@ -244,7 +244,7 @@ class TennisLoader:
             pl.col('whr_output').is_not_null()
         ).get_column('whr_output').to_list()
     
-    def to_riix_format(self, sample_games = 0):
+    def to_riix_format(self, surface = False, sample_games = 0):
         """
         Convert games to a polars dataframe suitable for the riix library of elo, glicko, trueskill
 
@@ -255,12 +255,26 @@ class TennisLoader:
         if sample_games != 0:
             df = df.tail(sample_games)
         df = df.with_columns(pl.lit(1.0).alias('Result'))
-        return df.select(['P1', 'P2', 'Result', 'Date']).sort('Date')
+        df_to_return = df.select(['P1', 'P2', 'Result', 'Date', 'Surface']).sort('Date')
+        if not surface:
+            df_to_return.drop("Surface")
+        return df_to_return
+    
+    def to_ttt_teammates(self, sample_games = 0):
+        """
+        Convert games to a ttt format bypassing the riix_dataset, in order to have team-mates as co-players
+
+        Returns:
+        ttt-suitable list
+        """
+        df_with_surfaces = self.to_riix_format(surface = True, sample_games = sample_games).sort('Day')
+
+        
     
     def to_ttt_format(self, sample_games = 0):
         """
         Convert games to a polars dataframe suitable for the TrueSkillThroughTime format
-
+        One-player games only - use teammates for more.
         Returns:
         Lists of games, and times they took place
         """
