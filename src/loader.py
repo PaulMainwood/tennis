@@ -1,4 +1,5 @@
 import subprocess
+import numpy as np
 import polars as pl
 import tempfile
 import os
@@ -244,32 +245,175 @@ class TennisLoader:
             pl.col('whr_output').is_not_null()
         ).get_column('whr_output').to_list()
     
-    def to_riix_format(self, sample_games = 0):
+    def _scramble_games(self, df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Randomly scramble the order of players and results for half of the games.
+        
+        For approximately half of the games (randomly chosen):
+        - Swap P1 and P2
+        - Set Result to 0.0 (indicating P1 lost)
+        
+        Args:
+            df: DataFrame containing games data with P1 and P2 columns
+            
+        Returns:
+            DataFrame with scrambled players and results
+        """
+        # Create a copy to avoid modifying the original DataFrame
+        scrambled_df = df.clone()
+        
+        # Generate random boolean mask for roughly half the rows
+        n_rows = len(scrambled_df)
+        if n_rows > 0:
+            # Create a random mask for about half the rows
+            np.random.seed(42)  # For reproducibility (optional)
+            scramble_mask = np.random.choice([True, False], size=n_rows)
+            
+            # Convert mask to Polars Series
+            scramble_series = pl.Series(scramble_mask)
+            
+            # For rows to scramble, swap P1 and P2
+            scrambled_df = scrambled_df.with_columns([
+                pl.when(scramble_series)
+                    .then(pl.col('P2'))
+                    .otherwise(pl.col('P1'))
+                    .alias('new_P1'),
+                    
+                pl.when(scramble_series)
+                    .then(pl.col('P1'))
+                    .otherwise(pl.col('P2'))
+                    .alias('new_P2'),
+            ])
+            
+            # Replace original columns with scrambled ones
+            scrambled_df = scrambled_df.with_columns([
+                pl.col('new_P1').alias('P1'),
+                pl.col('new_P2').alias('P2')
+            ]).drop(['new_P1', 'new_P2'])
+            
+            # Add a Result column (1.0 for non-scrambled, 0.0 for scrambled)
+            scrambled_df = scrambled_df.with_columns([
+                pl.when(scramble_series)
+                    .then(pl.lit(0.0))
+                    .otherwise(pl.lit(1.0))
+                    .alias('Result')
+            ])
+        
+        return scrambled_df
+
+    def to_riix_format(self, sample_games=0, scramble=True):
         """
         Convert games to a polars dataframe suitable for the riix library of elo, glicko, trueskill
 
+        Args:
+            sample_games: Number of games to sample (0 for all games)
+            scramble: Whether to scramble players and results (default: True)
+
         Returns:
-        Polars dataset in format: "P1, P2, Result (1.0, or 0.0), days (integers)"
+            Polars dataset in format: "P1, P2, Result (1.0 or 0.0), days (integers)"
         """
         df = self.games.sort('Day')
+        
         if sample_games != 0:
             df = df.tail(sample_games)
-        df = df.with_columns(pl.lit(1.0).alias('Result'))
+        
+        if scramble:
+            # Scramble players and add Result column
+            df = self._scramble_games(df)
+        else:
+            # Original behavior: all games have P1 as winner
+            df = df.with_columns(pl.lit(1.0).alias('Result'))
+        
         return df.select(['P1', 'P2', 'Result', 'Date']).sort('Date')
-    
-    def to_ttt_format(self, sample_games = 0):
+
+    def to_ttt_format(self, sample_games=0, scramble=True):
         """
         Convert games to a polars dataframe suitable for the TrueSkillThroughTime format
 
+        Args:
+            sample_games: Number of games to sample (0 for all games)
+            scramble: Whether to scramble players and results (default: True)
+
         Returns:
-        Lists of games, and times they took place
+            Tuple containing (games, days) where:
+            - games: List of games, each formatted as [[P1], [P2]], where P1 and P2
+              might have been swapped for about half the games if scramble=True
+            - days: List of day numbers when each game occurred
         """
         df = self.games.sort('Day')
-        #Allow to take a sample of the games for testing
+        
+        # Allow to take a sample of the games for testing
         if sample_games != 0:
             df = df.tail(sample_games)
-
+        
+        if scramble:
+            # Scramble the games (swap P1 and P2 for half of them)
+            df = self._scramble_games(df)
+        
+        # Format games as [[P1], [P2]] (with potentially scrambled P1/P2)
         games = [[[row[0]], [row[1]]] for row in df.select(['P1', 'P2']).rows()]
+        
         days = df['Day'].to_list()
         return (games, days)
-   
+    
+    def create_points_games(self):
+        """
+        Create a synthetic games table where each individual point becomes its own game.
+        
+        This method takes data from the stat_atp table, specifically:
+        - ID1 (player 1 ID)
+        - ID2 (player 2 ID)
+        - TPW_1 (total points won by player 1)
+        - TPW_2 (total points won by player 2)
+        
+        For each match, it creates one row per point won, with:
+        - Points won by player 1: P1=ID1, P2=ID2
+        - Points won by player 2: P1=ID2, P2=ID1
+        
+        Surface, Day, and Date columns are included but left empty/null.
+        
+        Returns:
+            pl.DataFrame: A synthetic games table with each point as a separate game
+        """
+        
+        # Get the stats table
+        stats_df = self.get_table('stat_atp')
+        if stats_df is None:
+            raise ValueError("stat_atp table not loaded")
+        
+        # Filter out rows with missing point data
+        stats_df = stats_df.filter(
+            (pl.col('TPW_1').is_not_null()) & 
+            (pl.col('TPW_2').is_not_null()) &
+            (pl.col('TPW_1') >= 0) &
+            (pl.col('TPW_2') >= 0)
+        )
+        
+        # Create empty lists to hold the expanded data
+        p1_list = []
+        p2_list = []
+        
+        # Process each row to expand into individual points
+        for row in stats_df.select(['ID1', 'ID2', 'TPW_1', 'TPW_2']).rows():
+            id1, id2, tpw_1, tpw_2 = row
+            
+            # Add rows for points won by player 1 (ID1)
+            for _ in range(int(tpw_1)):
+                p1_list.append(id1)  # P1 is ID1
+                p2_list.append(id2)  # P2 is ID2
+                
+            # Add rows for points won by player 2 (ID2)
+            for _ in range(int(tpw_2)):
+                p1_list.append(id2)  # P1 is ID2
+                p2_list.append(id1)  # P2 is ID1
+        
+        # Create the synthetic games dataframe
+        points_games_df = pl.DataFrame({
+            'P1': p1_list,
+            'P2': p2_list,
+            'Surface': [None] * len(p1_list),
+            'Day': [None] * len(p1_list),
+            'Date': [None] * len(p1_list)
+        })
+        
+        return points_games_df
